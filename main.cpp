@@ -151,7 +151,7 @@ void set_packet_without_set_chksum(struct tcp_packet* packet){
     backward_pkt.tcp_hdr.th_ack = forward_pkt.tcp_hdr.th_seq;
 
     forward_pkt.tcp_hdr.th_flags = TH_RST + TH_ACK;
-    backward_pkt.tcp_hdr.th_flags = TH_FIN;
+    backward_pkt.tcp_hdr.th_flags = TH_FIN + TH_ACK;
 
     forward_pkt.http_data.clear();
     backward_pkt.http_data.clear();
