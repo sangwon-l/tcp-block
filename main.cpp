@@ -19,14 +19,25 @@ using namespace std;
 #define tcp_port_http 80
 unsigned char my_mac_addr[6];
 char* pattern;
-
-struct tcp_packet{
+int org_data_len;
+#pragma pack(push, 1)
+struct forward_packet{
     struct libnet_ethernet_hdr eth_hdr;
     struct libnet_ipv4_hdr ip_hdr;
     struct libnet_tcp_hdr tcp_hdr;
-    string http_data;
 };
+#pragma pack(pop)
 
+#pragma pack(push, 1)
+struct backward_packet{
+    struct libnet_ethernet_hdr eth_hdr;
+    struct libnet_ipv4_hdr ip_hdr;
+    struct libnet_tcp_hdr tcp_hdr;
+    char http_data[11] = "blocked!!!";
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
 struct pshdr{
     in_addr sip;
     in_addr dip;
@@ -34,13 +45,17 @@ struct pshdr{
     u_char protocol;
     u_short length;
 };
+#pragma pack(pop)
 
+#pragma pack(push, 1)
 struct tcp_chksum{
     struct pshdr pshdr;
     struct libnet_tcp_hdr tcp;
 };
+#pragma pack(pop)
 
-struct tcp_packet forward_pkt, backward_pkt;
+struct forward_packet forward_pkt;
+struct backward_packet backward_pkt;
 
 void usage(){
     printf("syntax : tcp-block <interface> <pattern> \n");
@@ -108,6 +123,7 @@ bool pattern_matching(const u_char* packet){
         return false;
     }
     int tcp_hdr_len = tcp_hdr->th_off * 4;
+    org_data_len = ntohs(ipv4_hdr->ip_len) - ip_hdr_len - tcp_hdr_len;
 
     char* http_data = (char*)(packet + eth_hdr_len + ip_hdr_len + tcp_hdr_len);
     char* search = strstr(http_data, pattern);
@@ -119,7 +135,7 @@ bool pattern_matching(const u_char* packet){
     return true;
 }
 
-void set_packet_without_set_chksum(struct tcp_packet* packet){
+void set_packet_without_set_chksum(libnet_ethernet_hdr* eth_hdr, libnet_ipv4_hdr* ip_hdr, libnet_tcp_hdr* tcp_hdr){
     //ethernet header set
     int i;
     for(i = 0; i < 6; i++){
@@ -127,57 +143,96 @@ void set_packet_without_set_chksum(struct tcp_packet* packet){
         backward_pkt.eth_hdr.ether_shost[i] = my_mac_addr[i];
     }
     for(i = 0; i < 6; i++){
-        backward_pkt.eth_hdr.ether_dhost[i] = packet->eth_hdr.ether_shost[i];
+        forward_pkt.eth_hdr.ether_dhost[i] = eth_hdr->ether_dhost[i];
+        backward_pkt.eth_hdr.ether_dhost[i] = eth_hdr->ether_shost[i];
     }
+    forward_pkt.eth_hdr.ether_type=htons(eth_type_ipv4);
+    backward_pkt.eth_hdr.ether_type=htons(eth_type_ipv4);
 
     //ipv4 header set
+    forward_pkt.ip_hdr.ip_hl = 5;
+    backward_pkt.ip_hdr.ip_hl = 5;
+
+    forward_pkt.ip_hdr.ip_v = 4;
+    backward_pkt.ip_hdr.ip_v = 4;
+
+    forward_pkt.ip_hdr.ip_tos = 0;
+    backward_pkt.ip_hdr.ip_tos = 0;
+
     forward_pkt.ip_hdr.ip_len = htons(sizeof(struct libnet_ipv4_hdr) + sizeof(struct libnet_tcp_hdr));
-    char* block_msg = "blocked!";
-    backward_pkt.ip_hdr.ip_len = htons(sizeof(struct libnet_ipv4_hdr) + sizeof(struct libnet_tcp_hdr) + sizeof(block_msg));
+    backward_pkt.ip_hdr.ip_len = htons(sizeof(struct libnet_ipv4_hdr) + sizeof(struct libnet_tcp_hdr) + 11);
 
-    backward_pkt.ip_hdr.ip_ttl = htons(128);
+    forward_pkt.ip_hdr.ip_id = 0;
+    backward_pkt.ip_hdr.ip_id = 0;
 
-    backward_pkt.ip_hdr.ip_src = packet->ip_hdr.ip_dst;
-    backward_pkt.ip_hdr.ip_dst = packet->ip_hdr.ip_src;
+    forward_pkt.ip_hdr.ip_off = 0;
+    backward_pkt.ip_hdr.ip_off = 0;
+
+    forward_pkt.ip_hdr.ip_ttl = ip_hdr->ip_ttl;
+    backward_pkt.ip_hdr.ip_ttl = 128;
+
+    forward_pkt.ip_hdr.ip_p = ip_protocol_tcp;
+    backward_pkt.ip_hdr.ip_p = ip_protocol_tcp;
+
+    forward_pkt.ip_hdr.ip_sum = 0;
+    backward_pkt.ip_hdr.ip_sum = 0;
+
+    forward_pkt.ip_hdr.ip_src = ip_hdr->ip_src;
+    backward_pkt.ip_hdr.ip_src = ip_hdr->ip_dst;
+
+    forward_pkt.ip_hdr.ip_dst = ip_hdr->ip_dst;
+    backward_pkt.ip_hdr.ip_dst = ip_hdr->ip_src;
 
     //tcp header set
-    backward_pkt.tcp_hdr.th_sport = packet->tcp_hdr.th_dport;
-    backward_pkt.tcp_hdr.th_dport = packet->tcp_hdr.th_sport;
+    forward_pkt.tcp_hdr.th_sport = tcp_hdr->th_sport;
+    backward_pkt.tcp_hdr.th_sport = tcp_hdr->th_dport;
 
-    int data_len = sizeof(packet->http_data);
-    forward_pkt.tcp_hdr.th_seq = htonl(ntohl(packet->tcp_hdr.th_seq) + data_len);
+    forward_pkt.tcp_hdr.th_dport = tcp_hdr->th_dport;
+    backward_pkt.tcp_hdr.th_dport = tcp_hdr->th_sport;
 
-    backward_pkt.tcp_hdr.th_seq = packet->tcp_hdr.th_ack;
-    backward_pkt.tcp_hdr.th_ack = forward_pkt.tcp_hdr.th_seq;
+    forward_pkt.tcp_hdr.th_seq = htonl(ntohl(tcp_hdr->th_seq) + org_data_len);
+    backward_pkt.tcp_hdr.th_seq = tcp_hdr->th_ack;
 
-    forward_pkt.tcp_hdr.th_flags = TH_RST + TH_ACK;
+    forward_pkt.tcp_hdr.th_ack = tcp_hdr->th_ack;
+    backward_pkt.tcp_hdr.th_ack = htonl(ntohl(tcp_hdr->th_seq) + org_data_len);
+
+    forward_pkt.tcp_hdr.th_off = 5;
+    backward_pkt.tcp_hdr.th_off = 5;
+
+    forward_pkt.tcp_hdr.th_flags = TH_RST;
     backward_pkt.tcp_hdr.th_flags = TH_FIN + TH_ACK;
 
-    forward_pkt.http_data.clear();
-    backward_pkt.http_data.clear();
-    backward_pkt.http_data = block_msg;
+    forward_pkt.tcp_hdr.th_win = htons(0x8235);
+    backward_pkt.tcp_hdr.th_win = htons(0x8235);
+
+    forward_pkt.tcp_hdr.th_sum = 0;
+    backward_pkt.tcp_hdr.th_sum = 0;
+
+    forward_pkt.tcp_hdr.th_urp = 0;
+    backward_pkt.tcp_hdr.th_urp = 0;
 
     return;
 }
 
-void set_ip_chksum(struct tcp_packet *packet){
-    struct libnet_ipv4_hdr* ip_hdr = (struct libnet_ipv4_hdr *)(packet + sizeof(struct libnet_ethernet_hdr));
-    uint32_t sum = 0;
-    u_short sh[15];
-    memcpy(sh, ip_hdr, sizeof(ip_hdr));
-    int i;
-    for(i = 0; i < sizeof(ip_hdr) / 2; i++){
-        sum = sum + ntohs(sh[i]);
+u_short get_ip_chksum(u_short len_ip_header, char* IPbuff) {
+    u_short word16;
+    u_int sum = 0;
+    u_short i;
+
+    for(i = 0; i < len_ip_header; i = i + 2) {
+        word16 = ((IPbuff[i] << 8) & 0xFF00) + (IPbuff[i+1] & 0xFF);
+        sum = sum + (u_int) word16;
     }
-    if(sum >> 16){
+
+    while (sum >> 16)
         sum = (sum & 0xFFFF) + (sum >> 16);
-    }
+
     sum = ~sum;
-    packet->ip_hdr.ip_sum = (u_short)sum;
-    return;
+
+    return ((u_short) sum);
 }
 
-u_short set_tcp_chksum(int size, u_short *buffer) {
+u_short get_tcp_chksum(int size, u_short *buffer) {
     unsigned long cksum=0;
     while(size >1) {
         cksum+=*buffer++;
@@ -189,6 +244,33 @@ u_short set_tcp_chksum(int size, u_short *buffer) {
     cksum = (cksum >> 16) + (cksum & 0xffff);
     cksum += (cksum >>16);
     return (u_short)(~cksum);
+}
+
+void forward_send(forward_packet *mypacket, pcap_t *handle){
+    uint8_t * send_packet = (uint8_t *)malloc(sizeof(struct forward_packet));
+
+    int ip_hdr_offset = sizeof(mypacket->eth_hdr);
+    int tcp_hdr_offset = ip_hdr_offset + sizeof(mypacket->ip_hdr);
+
+    memcpy(&(send_packet[0]), &(mypacket->eth_hdr), sizeof(mypacket->eth_hdr));
+    memcpy(&(send_packet[ip_hdr_offset]), &(mypacket->ip_hdr), sizeof(mypacket->ip_hdr));
+    memcpy(&(send_packet[tcp_hdr_offset]), &(mypacket->tcp_hdr), sizeof(mypacket->tcp_hdr));
+
+    pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&send_packet[0]), sizeof(struct forward_packet));
+}
+
+void backward_send(backward_packet *mypacket, pcap_t *handle){
+    uint8_t * send_packet = (uint8_t *)malloc(sizeof(struct backward_packet));
+
+    int ip_hdr_offset = sizeof(mypacket->eth_hdr);
+    int tcp_hdr_offset = ip_hdr_offset + sizeof(mypacket->ip_hdr);
+    int tcp_data_offset = tcp_hdr_offset + sizeof(mypacket->tcp_hdr);
+
+    memcpy(&(send_packet[0]), &(mypacket->eth_hdr), sizeof(mypacket->eth_hdr));
+    memcpy(&(send_packet[ip_hdr_offset]), &(mypacket->ip_hdr), sizeof(mypacket->ip_hdr));
+    memcpy(&(send_packet[tcp_hdr_offset]), &(mypacket->tcp_hdr), sizeof(mypacket->tcp_hdr));
+    memcpy(&(send_packet[tcp_data_offset]), &(mypacket->http_data), 11);
+    pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&send_packet[0]), sizeof(struct backward_packet));
 }
 
 int main(int argc, char* argv[]){
@@ -225,22 +307,17 @@ int main(int argc, char* argv[]){
         if(check == false){
             continue;
         }
-        printf("1\n");
-        memcpy(&forward_pkt, packet, sizeof(packet));
-        memcpy(&backward_pkt, packet, sizeof(packet));
-        set_packet_without_set_chksum((struct tcp_packet*)packet);
-        forward_pkt.ip_hdr.ip_sum = 0;
-        backward_pkt.ip_hdr.ip_sum = 0;
-        forward_pkt.tcp_hdr.th_sum = 0;
-        backward_pkt.tcp_hdr.th_sum = 0;
-        printf("2\n");
+        struct libnet_ethernet_hdr* eth_hdr = (struct libnet_ethernet_hdr*)(packet);
+        struct libnet_ipv4_hdr* ip_hdr = (struct libnet_ipv4_hdr*)(packet+14);
+        int ip_hdr_len = ip_hdr->ip_hl * 4;
+        struct libnet_tcp_hdr* tcp_hdr = (struct libnet_tcp_hdr*)(packet+14+ip_hdr_len);
+        set_packet_without_set_chksum(eth_hdr, ip_hdr, tcp_hdr);
 
-        set_ip_chksum(&forward_pkt);
-        set_ip_chksum(&backward_pkt);
+        forward_pkt.ip_hdr.ip_sum = ntohs(get_ip_chksum(20, (char*)(&forward_pkt) + sizeof(struct libnet_ethernet_hdr)));
+        backward_pkt.ip_hdr.ip_sum = ntohs(get_ip_chksum(20, (char*)(&backward_pkt) + sizeof(struct libnet_ethernet_hdr)));
 
         tcp_chksum forward_chk;
         tcp_chksum backward_chk;
-        printf("3\n");
 
         forward_chk.pshdr.sip = forward_pkt.ip_hdr.ip_src;
         forward_chk.pshdr.dip = forward_pkt.ip_hdr.ip_dst;
@@ -253,16 +330,14 @@ int main(int argc, char* argv[]){
         backward_chk.pshdr.dip = backward_pkt.ip_hdr.ip_dst;
         backward_chk.pshdr.reserved = 0;
         backward_chk.pshdr.protocol = 6;
-        backward_chk.pshdr.length = htons(29);
+        backward_chk.pshdr.length = htons(31);
         memcpy(&backward_chk.tcp, &backward_pkt.tcp_hdr, 20);
 
-        forward_pkt.tcp_hdr.th_sum = set_tcp_chksum(sizeof(forward_chk), (u_short*)&forward_chk);
-        backward_pkt.tcp_hdr.th_sum = set_tcp_chksum(sizeof(backward_chk), (u_short*)&backward_chk);
-        printf("4\n");
-        pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&forward_pkt), sizeof(forward_pkt));
-        pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&backward_pkt), sizeof(backward_pkt));
-        printf("6\n");
+        forward_pkt.tcp_hdr.th_sum = get_tcp_chksum(sizeof(forward_chk), (u_short*)&forward_chk);
+        backward_pkt.tcp_hdr.th_sum = get_tcp_chksum(sizeof(backward_chk), (u_short*)&backward_chk);
 
+        forward_send(&forward_pkt,handle);
+        backward_send(&backward_pkt,handle);
     }
     return 0;
 }
